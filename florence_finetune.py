@@ -553,19 +553,45 @@ def parse_point(raw_text: str):
     return int(hits[0]), int(hits[1])
 
 
+def _normalize_eval_item(item, ds):
+    """Accept both build_training_items shape (gt_x/gt_y/human_text/row_idx)
+    and florence_samples shape (gt_point/referring_expression, image inline or
+    via source_idx). Returns a dict with row_idx, gt_x, gt_y, human_text,
+    width, height."""
+    if "gt_x" in item and "gt_y" in item:
+        return {
+            "row_idx": item["row_idx"],
+            "gt_x": item["gt_x"],
+            "gt_y": item["gt_y"],
+            "human_text": item.get("human_text") or item.get("referring_expression", ""),
+            "width": item["width"],
+            "height": item["height"],
+        }
+    # florence_samples shape
+    gx, gy = item["gt_point"]
+    return {
+        "row_idx": item.get("source_idx"),
+        "gt_x": gx,
+        "gt_y": gy,
+        "human_text": item.get("referring_expression", ""),
+        "width": item["width"],
+        "height": item["height"],
+    }
+
+
 def evaluate(model, processor, eval_items, ds, max_new_tokens=8, verbose_first_n=3):
-    """Greedy point-prediction inference. Returns DataFrame matching compute_metrics."""
+    """Greedy point-prediction inference. Returns DataFrame matching compute_metrics.
+
+    Accepts items in either the build_training_items shape (gt_x/gt_y) or the
+    florence_samples shape (gt_point=(x,y))."""
     model.eval()
     device = next(model.parameters()).device
     rows = []
     t0 = time.time()
-    for i, item in enumerate(eval_items):
+    for i, raw_item in enumerate(eval_items):
+        item = _normalize_eval_item(raw_item, ds)
         try:
             image = decode_image(ds["image"][item["row_idx"]])
-            # Match training distribution: standardize the image (we
-            # discard the remapped coords here — we still report errors
-            # in the original-pixel space later via compute_metrics, which
-            # only looks at the [0,999] normalized prediction).
             image, _ = standardize_sample_for_training(
                 image, [(item["gt_x"], item["gt_y"])]
             )
