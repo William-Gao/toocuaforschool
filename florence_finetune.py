@@ -147,7 +147,30 @@ def get_loc_token_ids(processor, verbose=True):
 # ---------------------------------------------------------------------------
 
 def extract_element_description(text: str) -> str:
+    """Pull just the element description from a UGround-style prompt.
+
+    The dataset's human messages embed the description after a "Description:"
+    line, e.g.
+
+        Your task is to help the user identify the precise coordinates ...
+        ...
+        Description: The text "SHIMMER BOMBER JACKET" located under the
+        second image in the bomber jackets listing.
+
+    We extract everything after "Description:" up to the next newline. The
+    earlier heuristic split on " located "/" in "/etc., which would chop the
+    middle of valid descriptions; that path is now only used as a fallback
+    for prompts that don't have the Description: marker.
+    """
     text = (text or "").replace("<image>", "").strip()
+
+    m = re.search(r"Description\s*:\s*(.+)", text, flags=re.IGNORECASE)
+    if m:
+        desc = m.group(1).split("\n")[0].strip()
+        if desc:
+            return desc
+
+    # Legacy fallbacks (older prompt formats with no "Description:" marker).
     for marker in ["described as follows:", "element is:", "looking for:", "locate:"]:
         if marker in text.lower():
             idx = text.lower().index(marker) + len(marker)
