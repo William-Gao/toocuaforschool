@@ -438,7 +438,9 @@ class TrainCfg:
     output_dir: str
     drive_dir: str | None = None
     smoke: bool = False
-    lambda_l2: float = 0.01
+    # lambda_l2=0.01 is too small (CE dominates; model learns format but not precision).
+    # 0.1 gives stronger coordinate supervision while keeping training stable.
+    lambda_l2: float = 0.1
     lr: float = 2e-4
     batch_size: int = 2
     grad_accum: int = 4
@@ -579,11 +581,48 @@ def _normalize_eval_item(item, ds):
     }
 
 
+def _destandardize_pred(pred_x_std: int, pred_y_std: int,
+                         orig_w: int, orig_h: int):
+    """Convert <loc_X><loc_Y> from 512×512 canvas space back to original 0-999 space.
+
+    During training the image is letterboxed to TARGET_RESOLUTION and GT coords
+    are remapped accordingly. At inference the same letterboxing is applied, so the
+    model's <loc_*> outputs are in the letterboxed space. This function inverts that
+    transform so predictions can be compared against GT coords in the original space."""
+    scale = min(TARGET_RESOLUTION / orig_w, TARGET_RESOLUTION / orig_h)
+    new_w = int(orig_w * scale)
+    new_h = int(orig_h * scale)
+    pad_x = (TARGET_RESOLUTION - new_w) // 2
+    pad_y = (TARGET_RESOLUTION - new_h) // 2
+
+    # loc token → pixel on 512 canvas
+    px_canvas = pred_x_std / 999.0 * TARGET_RESOLUTION
+    py_canvas = pred_y_std / 999.0 * TARGET_RESOLUTION
+
+    # remove letterbox padding → pixel in resized image
+    px_resized = px_canvas - pad_x
+    py_resized = py_canvas - pad_y
+
+    # scale back to original image pixels
+    px_orig = px_resized / scale
+    py_orig = py_resized / scale
+
+    # convert to 0-999 (clamp to valid range)
+    x = int(round(max(0.0, min(999.0, px_orig / orig_w * 999.0))))
+    y = int(round(max(0.0, min(999.0, py_orig / orig_h * 999.0))))
+    return x, y
+
+
 def evaluate(model, processor, eval_items, ds, max_new_tokens=8, verbose_first_n=3):
     """Greedy point-prediction inference. Returns DataFrame matching compute_metrics.
 
     Accepts items in either the build_training_items shape (gt_x/gt_y) or the
-    florence_samples shape (gt_point=(x,y))."""
+    florence_samples shape (gt_point=(x,y)).
+
+    The model is trained on 512×512 letterboxed images and emits <loc_*> tokens
+    in that canvas space. Predictions are de-standardized back to the original
+    image's 0-999 coordinate space before being written to the DataFrame so that
+    compute_metrics (which scales by the original width/height) is correct."""
     model.eval()
     device = next(model.parameters()).device
     rows = []
@@ -591,13 +630,14 @@ def evaluate(model, processor, eval_items, ds, max_new_tokens=8, verbose_first_n
     for i, raw_item in enumerate(eval_items):
         item = _normalize_eval_item(raw_item, ds)
         try:
-            image = decode_image(ds["image"][item["row_idx"]])
-            image, _ = standardize_sample_for_training(
-                image, [(item["gt_x"], item["gt_y"])]
+            orig_image = decode_image(ds["image"][item["row_idx"]])
+            orig_w, orig_h = orig_image.size
+            std_image, _ = standardize_sample_for_training(
+                orig_image, [(item["gt_x"], item["gt_y"])]
             )
             cleaned = extract_element_description(item["human_text"])
             prompt = f"{TASK} {cleaned}"
-            inputs = processor(text=prompt, images=image, return_tensors="pt").to(device)
+            inputs = processor(text=prompt, images=std_image, return_tensors="pt").to(device)
             pixel_values = inputs["pixel_values"]
             if device.type == "cuda":
                 # Match the model's actual dtype (cell 47 loads Florence in fp16,
@@ -618,14 +658,21 @@ def evaluate(model, processor, eval_items, ds, max_new_tokens=8, verbose_first_n
                     num_beams=1,
                 )
             raw = processor.batch_decode(gen_ids, skip_special_tokens=False)[0]
-            pred = parse_point(raw)
+            pred_std = parse_point(raw)
+            # De-standardize: convert from 512×512 canvas coords back to original
+            # image 0-999 coords so compute_metrics stays in the right space.
+            if pred_std is not None:
+                pred = _destandardize_pred(pred_std[0], pred_std[1], orig_w, orig_h)
+            else:
+                pred = None
         except Exception as e:
             raw = f"[ERROR: {type(e).__name__}: {e}]"
             pred = None
+            orig_w, orig_h = item["width"], item["height"]
 
         if i < verbose_first_n:
             print(f"[florence-eval {i}] gt=({item['gt_x']},{item['gt_y']}) "
-                  f"pred={pred} raw={raw[:120]!r}")
+                  f"pred_destd={pred} raw={raw[:120]!r}")
 
         rows.append({
             "row_idx": item["row_idx"],
