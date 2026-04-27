@@ -600,9 +600,15 @@ def evaluate(model, processor, eval_items, ds, max_new_tokens=8, verbose_first_n
             inputs = processor(text=prompt, images=image, return_tensors="pt").to(device)
             pixel_values = inputs["pixel_values"]
             if device.type == "cuda":
-                pixel_values = pixel_values.to(
-                    torch.float16 if not torch.cuda.is_bf16_supported() else torch.bfloat16
+                # Match the model's actual dtype (cell 47 loads Florence in fp16,
+                # but a user may load it in bf16). LoRA adapters can be fp32; we
+                # need the dtype of a *base* (non-LoRA) float parameter so the
+                # vision encoder's biases match.
+                base_dtype = next(
+                    p.dtype for n, p in model.named_parameters()
+                    if "lora_" not in n and p.is_floating_point()
                 )
+                pixel_values = pixel_values.to(base_dtype)
             with torch.inference_mode():
                 gen_ids = model.generate(
                     input_ids=inputs["input_ids"],
