@@ -633,6 +633,7 @@ def evaluate(model, processor, eval_items, ds, max_new_tokens=8, verbose_first_n
             "height": item["height"],
             "gt_x": item["gt_x"],
             "gt_y": item["gt_y"],
+            "referring_expression": item["human_text"],
             "raw_output": raw,
             "pred_x": pred[0] if pred else None,
             "pred_y": pred[1] if pred else None,
