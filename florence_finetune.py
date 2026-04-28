@@ -291,14 +291,29 @@ def make_collate(pad_id: int):
 # ---------------------------------------------------------------------------
 
 class FlorencePointTrainer(Trainer):
-    """Adds a differentiable L2 loss over the two <loc_*> answer positions."""
+    """Combined-loss trainer for the two <loc_*> answer positions.
 
-    def __init__(self, *args, loc_token_ids: torch.Tensor, lambda_l2: float = 0.01,
+    Loss = CE_all_positions  +  lambda_soft * GaussianSoftCE  +  lambda_l2 * L2_expectation
+
+    GaussianSoftCE: at each loc position, the target is a Gaussian over the
+    1000 loc tokens centered on the GT coordinate (std=sigma in token space).
+    Cross-entropy against this soft target rewards both correctness *and*
+    sharp peaks near GT — directly aligning training with argmax inference.
+    Replaces the L2 expectation loss in the default config.
+
+    L2_expectation: kept available (lambda_l2=0 by default) for A/B comparison.
+    """
+
+    def __init__(self, *args, loc_token_ids: torch.Tensor,
+                 lambda_l2: float = 0.0,
+                 lambda_soft: float = 0.5,
+                 sigma: float = 5.0,
                  debug_first_n: int = 3, **kwargs):
         super().__init__(*args, **kwargs)
-        # Register as buffer-like; moved to model device in compute_loss.
         self._loc_token_ids = loc_token_ids
         self.lambda_l2 = lambda_l2
+        self.lambda_soft = lambda_soft
+        self.sigma = sigma
         self._debug_left = debug_first_n
 
     def compute_loss(self, model, inputs, return_outputs=False, **kw):
@@ -317,54 +332,61 @@ class FlorencePointTrainer(Trainer):
         # For each example, find the first two label positions whose token ID is
         # in the [<loc_0>..<loc_999>] range. These are the X and Y positions.
         is_loc = (labels >= loc_id_min) & (labels <= loc_id_max) & (labels != -100)
-        # Index of the first and second loc token per row. If a row is malformed
-        # (only 0 or 1 loc tokens), skip its L2 contribution.
         B, T = labels.shape
         device = logits.device
+
+        coord_grid = torch.arange(1000, device=device, dtype=torch.float32)
         l2_terms = []
+        soft_terms = []
         for b in range(B):
             positions = is_loc[b].nonzero(as_tuple=False).flatten()
             if positions.numel() < 2:
                 continue
             x_pos = positions[0].item()
             y_pos = positions[1].item()
-            x_logits = logits[b, x_pos, loc_ids]
-            y_logits = logits[b, y_pos, loc_ids]
-            x_probs = torch.softmax(x_logits.float(), dim=-1)
-            y_probs = torch.softmax(y_logits.float(), dim=-1)
-            coord_grid = torch.arange(1000, device=device, dtype=torch.float32)
-            exp_x = (x_probs * coord_grid).sum()
-            exp_y = (y_probs * coord_grid).sum()
-            term = torch.sqrt(
-                (exp_x - gt_x[b].to(device).float()) ** 2
-                + (exp_y - gt_y[b].to(device).float()) ** 2
-                + 1e-6
-            )
-            l2_terms.append(term)
+            x_logits = logits[b, x_pos, loc_ids].float()
+            y_logits = logits[b, y_pos, loc_ids].float()
 
-        if l2_terms:
-            loss_l2 = torch.stack(l2_terms).mean() / 999.0
-        else:
-            # No valid loc positions in this batch; pass a zero with grad so
-            # the optimizer step is well-defined.
-            loss_l2 = torch.zeros((), device=device, dtype=torch.float32)
+            # --- Gaussian soft-CE term ---
+            if self.lambda_soft > 0:
+                gx = gt_x[b].to(device).float()
+                gy = gt_y[b].to(device).float()
+                target_x = torch.softmax(-(coord_grid - gx) ** 2 / (2 * self.sigma ** 2), dim=-1)
+                target_y = torch.softmax(-(coord_grid - gy) ** 2 / (2 * self.sigma ** 2), dim=-1)
+                log_p_x = torch.log_softmax(x_logits, dim=-1)
+                log_p_y = torch.log_softmax(y_logits, dim=-1)
+                soft_terms.append(-(target_x * log_p_x).sum() - (target_y * log_p_y).sum())
 
-        loss = loss_ce + self.lambda_l2 * loss_l2
+            # --- L2 expectation term (kept for A/B; default lambda_l2=0) ---
+            if self.lambda_l2 > 0:
+                x_probs = torch.softmax(x_logits, dim=-1)
+                y_probs = torch.softmax(y_logits, dim=-1)
+                exp_x = (x_probs * coord_grid).sum()
+                exp_y = (y_probs * coord_grid).sum()
+                l2_terms.append(torch.sqrt(
+                    (exp_x - gt_x[b].to(device).float()) ** 2
+                    + (exp_y - gt_y[b].to(device).float()) ** 2
+                    + 1e-6
+                ))
 
-        # Lightweight debug: print the first few steps so the user can spot
-        # NaNs, format issues, or wildly imbalanced loss terms.
+        loss_soft = (torch.stack(soft_terms).mean()
+                     if soft_terms else torch.zeros((), device=device))
+        loss_l2 = (torch.stack(l2_terms).mean() / 999.0
+                   if l2_terms else torch.zeros((), device=device))
+
+        loss = loss_ce + self.lambda_soft * loss_soft + self.lambda_l2 * loss_l2
+
         if self._debug_left > 0:
-            ex_x = float(exp_x.detach().item()) if l2_terms else float("nan")
-            ex_y = float(exp_y.detach().item()) if l2_terms else float("nan")
             print(f"[florence] step debug: loss={loss.item():.4f} "
-                  f"ce={loss_ce.item():.4f} l2_norm={loss_l2.item():.4f} "
-                  f"exp_xy=({ex_x:.0f},{ex_y:.0f}) "
+                  f"ce={loss_ce.item():.4f} "
+                  f"soft={loss_soft.item():.4f} (λ={self.lambda_soft}, σ={self.sigma}) "
+                  f"l2={loss_l2.item():.4f} (λ={self.lambda_l2}) "
                   f"gt0=({gt_x[0].item():.0f},{gt_y[0].item():.0f})")
             self._debug_left -= 1
 
-        # Surface both terms in Trainer's normal logging stream.
         try:
             self.log({"loss_ce": float(loss_ce.detach()),
+                      "loss_soft": float(loss_soft.detach()),
                       "loss_l2_norm": float(loss_l2.detach())})
         except Exception:
             pass
@@ -461,9 +483,16 @@ class TrainCfg:
     output_dir: str
     drive_dir: str | None = None
     smoke: bool = False
-    # lambda_l2=0.01 is too small (CE dominates; model learns format but not precision).
-    # 0.1 gives stronger coordinate supervision while keeping training stable.
-    lambda_l2: float = 0.1
+    # Gaussian soft-CE on the 2 loc positions (the "second loss"). Replaces the
+    # plain L2-expectation term: encourages a sharp peak at GT (matching argmax
+    # inference) AND penalizes wrong tokens linearly with distance via the
+    # Gaussian-smoothed target. sigma is in 0-999 token space; ~5 is a good
+    # default (≈ a few pixel rows on a 512x512 canvas).
+    lambda_soft: float = 0.5
+    sigma: float = 5.0
+    # L2-expectation term is now disabled by default (lambda_soft replaces it).
+    # Set lambda_l2 > 0 to enable for A/B comparison.
+    lambda_l2: float = 0.0
     lr: float = 2e-4
     batch_size: int = 2
     grad_accum: int = 4
@@ -536,12 +565,16 @@ def train(model, processor, ds, train_items, cfg: TrainCfg):
         data_collator=collate,
         loc_token_ids=loc_ids,
         lambda_l2=cfg.lambda_l2,
+        lambda_soft=cfg.lambda_soft,
+        sigma=cfg.sigma,
         callbacks=callbacks,
     )
 
     print(f"[florence] starting training: smoke={cfg.smoke} "
           f"items={len(train_items)} bsz={cfg.batch_size} "
-          f"accum={cfg.grad_accum} lambda_l2={cfg.lambda_l2}")
+          f"accum={cfg.grad_accum} "
+          f"lambda_soft={cfg.lambda_soft} sigma={cfg.sigma} "
+          f"lambda_l2={cfg.lambda_l2}")
 
     def _has_ckpts(d):
         return os.path.isdir(d) and any(
@@ -636,7 +669,33 @@ def _destandardize_pred(pred_x_std: int, pred_y_std: int,
     return x, y
 
 
-def evaluate(model, processor, eval_items, ds, max_new_tokens=8, verbose_first_n=3):
+def _expectation_from_scores(scores, gen_seq, loc_ids, loc_id_min, loc_id_max):
+    """Recover (x, y) by taking the softmax expectation over the 1000 loc tokens
+    at the two greedy-decoded loc positions.
+
+    `scores` is the per-step logits tuple from generate(..., output_scores=True,
+    return_dict_in_generate=True): each element is shape [1, vocab].
+    `gen_seq` is the full decoder sequence (including the decoder_start_token).
+    The last len(scores) tokens of gen_seq correspond 1:1 with scores."""
+    n_new = len(scores)
+    new_tokens = gen_seq[-n_new:]
+    coord = torch.arange(1000, device=loc_ids.device, dtype=torch.float32)
+    exps = []
+    for tok_id, step_logits in zip(new_tokens, scores):
+        if loc_id_min <= int(tok_id) <= loc_id_max:
+            loc_logits = step_logits[0, loc_ids].float()
+            probs = torch.softmax(loc_logits, dim=-1)
+            exps.append((probs * coord).sum().item())
+            if len(exps) == 2:
+                break
+    if len(exps) < 2:
+        return None
+    return int(round(max(0.0, min(999.0, exps[0])))), \
+           int(round(max(0.0, min(999.0, exps[1]))))
+
+
+def evaluate(model, processor, eval_items, ds, max_new_tokens=8,
+             verbose_first_n=3, decode_mode="expectation"):
     """Greedy point-prediction inference. Returns DataFrame matching compute_metrics.
 
     Accepts items in either the build_training_items shape (gt_x/gt_y) or the
@@ -645,9 +704,22 @@ def evaluate(model, processor, eval_items, ds, max_new_tokens=8, verbose_first_n
     The model is trained on 512×512 letterboxed images and emits <loc_*> tokens
     in that canvas space. Predictions are de-standardized back to the original
     image's 0-999 coordinate space before being written to the DataFrame so that
-    compute_metrics (which scales by the original width/height) is correct."""
+    compute_metrics (which scales by the original width/height) is correct.
+
+    decode_mode:
+      - "expectation" (default): take softmax · [0..999] over the loc subspace
+        at the two greedy loc positions. Matches the Gaussian-soft-CE training
+        objective and is robust to slightly smeared distributions.
+      - "argmax": original behaviour — parse <loc_X><loc_Y> from the decoded
+        text and use those token indices directly."""
+    if decode_mode not in ("expectation", "argmax"):
+        raise ValueError(f"decode_mode must be 'expectation' or 'argmax', got {decode_mode!r}")
     model.eval()
     device = next(model.parameters()).device
+    loc_ids = get_loc_token_ids(processor, verbose=False).to(device)
+    loc_id_min = int(loc_ids.min().item())
+    loc_id_max = int(loc_ids.max().item())
+
     rows = []
     t0 = time.time()
     for i, raw_item in enumerate(eval_items):
@@ -663,27 +735,40 @@ def evaluate(model, processor, eval_items, ds, max_new_tokens=8, verbose_first_n
             inputs = processor(text=prompt, images=std_image, return_tensors="pt").to(device)
             pixel_values = inputs["pixel_values"]
             if device.type == "cuda":
-                # Match the model's actual dtype (cell 47 loads Florence in fp16,
-                # but a user may load it in bf16). LoRA adapters can be fp32; we
-                # need the dtype of a *base* (non-LoRA) float parameter so the
-                # vision encoder's biases match.
                 base_dtype = next(
                     p.dtype for n, p in model.named_parameters()
                     if "lora_" not in n and p.is_floating_point()
                 )
                 pixel_values = pixel_values.to(base_dtype)
             with torch.inference_mode():
-                gen_ids = model.generate(
+                gen_out = model.generate(
                     input_ids=inputs["input_ids"],
                     pixel_values=pixel_values,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
                     num_beams=1,
+                    output_scores=(decode_mode == "expectation"),
+                    return_dict_in_generate=(decode_mode == "expectation"),
                 )
+            if decode_mode == "expectation":
+                gen_ids = gen_out.sequences
+                scores = gen_out.scores
+            else:
+                gen_ids = gen_out
+                scores = None
             raw = processor.batch_decode(gen_ids, skip_special_tokens=False)[0]
-            pred_std = parse_point(raw)
-            # De-standardize: convert from 512×512 canvas coords back to original
-            # image 0-999 coords so compute_metrics stays in the right space.
+
+            if decode_mode == "expectation" and scores:
+                pred_std = _expectation_from_scores(
+                    scores, gen_ids[0].tolist(), loc_ids, loc_id_min, loc_id_max,
+                )
+                # If no loc tokens appeared in the greedy decode, fall back to
+                # the text-parse path so we still return something useful.
+                if pred_std is None:
+                    pred_std = parse_point(raw)
+            else:
+                pred_std = parse_point(raw)
+
             if pred_std is not None:
                 pred = _destandardize_pred(pred_std[0], pred_std[1], orig_w, orig_h)
             else:
@@ -695,7 +780,7 @@ def evaluate(model, processor, eval_items, ds, max_new_tokens=8, verbose_first_n
 
         if i < verbose_first_n:
             print(f"[florence-eval {i}] gt=({item['gt_x']},{item['gt_y']}) "
-                  f"pred_destd={pred} raw={raw[:120]!r}")
+                  f"pred_destd={pred} mode={decode_mode} raw={raw[:120]!r}")
 
         rows.append({
             "row_idx": item["row_idx"],
@@ -709,6 +794,6 @@ def evaluate(model, processor, eval_items, ds, max_new_tokens=8, verbose_first_n
             "pred_y": pred[1] if pred else None,
         })
     elapsed = time.time() - t0
-    print(f"[florence] eval done: {len(rows)} samples in {elapsed:.1f}s "
-          f"({elapsed / max(len(rows), 1):.2f}s/sample)")
+    print(f"[florence] eval done ({decode_mode}): {len(rows)} samples in "
+          f"{elapsed:.1f}s ({elapsed / max(len(rows), 1):.2f}s/sample)")
     return pd.DataFrame(rows)
