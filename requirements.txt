@@ -1,0 +1,32 @@
+# CS 1090B — MS4: Training a CUA for GUI Task Automation
+# Tested on Google Colab (Python 3.12, CUDA 12.x, A100 GPU).
+#
+# NOTE: Florence-2 and Qwen2-VL require different transformers versions.
+# The notebook installs transformers==4.44.2 first (Florence-2), then
+# upgrades to >=4.45.0 before loading Qwen2-VL.  See the notebook's
+# Section 0 and Section 4b for details.
+
+# --- Core ---
+datasets>=2.14.0
+huggingface_hub>=0.20.0
+transformers==4.44.2       # Florence-2; upgraded to >=4.45.0 for Qwen2-VL
+accelerate>=0.25.0
+torch>=2.1.0
+
+# --- Fine-tuning (LoRA) ---
+peft>=0.12.0
+torchao>=0.16.0
+
+# --- Vision / data ---
+Pillow>=10.0.0
+timm>=0.9.0
+einops>=0.7.0
+
+# --- Qwen2-VL utilities ---
+qwen-vl-utils>=0.0.2
+
+# --- Analysis & visualization ---
+numpy>=1.24.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
